@@ -19,7 +19,7 @@ from torchvision import transforms
 from torchvision.datasets import MNIST
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
-
+import os
 
 # ---------------------------
 # Schedules + utilities
@@ -305,7 +305,7 @@ def main():
     epochs = 120
     batch_size = 128
     lr = 2e-4
-    save_dir = r"C:\Research\Sample\output"
+    save_dir = r"C:\Users\ngu89426\Research\Diffusion-Models-MNIST\output"
 
     schedules = make_schedules(T, device)
     model = TimeConditionedCNN(base_ch=128, time_dim=256).to(device)
