@@ -1,0 +1,348 @@
+# -*- coding: utf-8 -*-
+"""
+Minimal DDPM on MNIST (improved v2):
+✅ x0 clamp during sampling (stability / fewer artifacts)
+✅ EMA weights for cleaner samples (standard diffusion trick)
+✅ Optional DDIM sampling with fewer steps (faster + often sharper)
+
+Run:
+  python source_code_updated_v2.py
+"""
+
+import math
+import copy
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+from torchvision import transforms
+from torchvision.datasets import MNIST
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+
+
+# ---------------------------
+# Schedules + utilities
+# ---------------------------
+def linear_beta_schedule(T, beta_start=1e-4, beta_end=2e-2):
+    return torch.linspace(beta_start, beta_end, T)
+
+def extract(a, t, x_shape):
+    """
+    a: (T,) tensor
+    t: (B,) int64 tensor
+    returns (B,1,1,1) broadcastable to x_shape
+    """
+    B = t.shape[0]
+    out = a.gather(0, t)  # (B,)
+    return out.view(B, *([1] * (len(x_shape) - 1)))
+
+def make_schedules(T, device):
+    betas = linear_beta_schedule(T).to(device)               # (T,)
+    alphas = 1.0 - betas                                     # (T,)
+    alphas_cumprod = torch.cumprod(alphas, dim=0)            # (T,)
+    alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
+
+    sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+    sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
+
+    # DDPM posterior variance: beta_t * (1 - abar_{t-1}) / (1 - abar_t)
+    posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+
+    return {
+        "betas": betas,
+        "alphas": alphas,
+        "alphas_cumprod": alphas_cumprod,
+        "alphas_cumprod_prev": alphas_cumprod_prev,
+        "sqrt_alphas_cumprod": sqrt_alphas_cumprod,
+        "sqrt_one_minus_alphas_cumprod": sqrt_one_minus_alphas_cumprod,
+        "posterior_variance": posterior_variance,
+    }
+
+
+def q_sample(x0, t, schedules, noise=None):
+    """
+    Forward diffusion: x_t = sqrt(abar_t)*x0 + sqrt(1-abar_t)*eps
+    """
+    if noise is None:
+        noise = torch.randn_like(x0)
+    sqrt_ab = extract(schedules["sqrt_alphas_cumprod"], t, x0.shape)
+    sqrt_1mab = extract(schedules["sqrt_one_minus_alphas_cumprod"], t, x0.shape)
+    xt = sqrt_ab * x0 + sqrt_1mab * noise
+    return xt, noise
+
+
+# ---------------------------
+# Time embedding + model
+# ---------------------------
+class SinusoidalPosEmb(nn.Module):
+    """Standard sinusoidal embedding for timesteps."""
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t):
+        half = self.dim // 2
+        device = t.device
+        t = t.float()
+        freqs = torch.exp(torch.linspace(0, math.log(10000), half, device=device))
+        freqs = 1.0 / freqs
+        args = t[:, None] * freqs[None, :]
+        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+
+class Block(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+        self.gn = nn.GroupNorm(8, out_ch)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        return self.act(self.gn(self.conv(x)))
+
+class TimeConditionedCNN(nn.Module):
+    """
+    Deeper + wider CNN with timestep conditioning.
+    Predicts eps_theta(x_t, t).
+    """
+    def __init__(self, in_ch=1, base_ch=128, time_dim=256):
+        super().__init__()
+        self.time_mlp = nn.Sequential(
+            SinusoidalPosEmb(time_dim),
+            nn.Linear(time_dim, time_dim),
+            nn.SiLU(),
+            nn.Linear(time_dim, base_ch),
+        )
+
+        self.b1 = Block(in_ch, base_ch)
+        self.b2 = Block(base_ch, base_ch)
+        self.b3 = Block(base_ch, base_ch)
+        self.b4 = Block(base_ch, base_ch)
+        self.b5 = Block(base_ch, base_ch)
+        self.out = nn.Conv2d(base_ch, in_ch, 3, padding=1)
+
+    def forward(self, x, t):
+        h = self.b1(x)
+        temb = self.time_mlp(t)[:, :, None, None]  # (B, base_ch, 1, 1)
+        h = h + temb
+        h = self.b2(h)
+        h = self.b3(h)
+        h = self.b4(h)
+        h = self.b5(h)
+        return self.out(h)
+
+
+# ---------------------------
+# EMA helper
+# ---------------------------
+@torch.no_grad()
+def update_ema(ema_model, model, decay=0.999):
+    for ema_p, p in zip(ema_model.parameters(), model.parameters()):
+        ema_p.data.mul_(decay).add_(p.data, alpha=1.0 - decay)
+
+
+# ---------------------------
+# Sampling (DDPM with x0 clamp)
+# ---------------------------
+@torch.no_grad()
+def p_sample_ddpm(model, x_t, t, schedules, clamp_x0=True):
+    betas_t = extract(schedules["betas"], t, x_t.shape)
+    alphas_t = extract(schedules["alphas"], t, x_t.shape)
+    abar_t = extract(schedules["alphas_cumprod"], t, x_t.shape)
+    abar_prev = extract(schedules["alphas_cumprod_prev"], t, x_t.shape)
+
+    eps_pred = model(x_t, t)
+
+    # x0_hat = (x_t - sqrt(1-abar_t)*eps) / sqrt(abar_t)
+    x0_hat = (x_t - torch.sqrt(1.0 - abar_t) * eps_pred) / torch.sqrt(abar_t)
+    if clamp_x0:
+        x0_hat = x0_hat.clamp(-1.0, 1.0)
+
+    # posterior mean: coef1*x0_hat + coef2*x_t
+    coef1 = betas_t * torch.sqrt(abar_prev) / (1.0 - abar_t)
+    coef2 = (1.0 - abar_prev) * torch.sqrt(alphas_t) / (1.0 - abar_t)
+    model_mean = coef1 * x0_hat + coef2 * x_t
+
+    posterior_var_t = extract(schedules["posterior_variance"], t, x_t.shape)
+
+    noise = torch.randn_like(x_t)
+    nonzero_mask = (t != 0).float().view(x_t.shape[0], *([1] * (len(x_t.shape) - 1)))
+    x_prev = model_mean + nonzero_mask * torch.sqrt(posterior_var_t) * noise
+    return x_prev
+
+@torch.no_grad()
+def sample_ddpm(model, schedules, T, image_size=28, num_samples=16, device="cpu", clamp_x0=True):
+    model.eval()
+    x = torch.randn((num_samples, 1, image_size, image_size), device=device)  # x_T
+    for step in reversed(range(T)):
+        t = torch.full((num_samples,), step, device=device, dtype=torch.long)
+        x = p_sample_ddpm(model, x, t, schedules, clamp_x0=clamp_x0)
+    return x
+
+
+# ---------------------------
+# Optional: DDIM sampling (fewer steps)
+# ---------------------------
+@torch.no_grad()
+def sample_ddim(model, schedules, T, steps=50, eta=0.0, image_size=28, num_samples=16, device="cpu", clamp_x0=True):
+    model.eval()
+    x = torch.randn((num_samples, 1, image_size, image_size), device=device)
+
+    timesteps = torch.linspace(0, T - 1, steps, device=device).round().long()
+    timesteps = torch.unique(timesteps).tolist()
+
+    for i in reversed(range(len(timesteps))):
+        t_val = timesteps[i]
+        t = torch.full((num_samples,), t_val, device=device, dtype=torch.long)
+
+        abar_t = extract(schedules["alphas_cumprod"], t, x.shape)
+        eps = model(x, t)
+
+        x0_hat = (x - torch.sqrt(1.0 - abar_t) * eps) / torch.sqrt(abar_t)
+        if clamp_x0:
+            x0_hat = x0_hat.clamp(-1.0, 1.0)
+
+        if i == 0:
+            x = x0_hat
+            continue
+
+        t_prev_val = timesteps[i - 1]
+        t_prev = torch.full((num_samples,), t_prev_val, device=device, dtype=torch.long)
+        abar_prev = extract(schedules["alphas_cumprod"], t_prev, x.shape)
+
+        sigma = eta * torch.sqrt((1.0 - abar_prev) / (1.0 - abar_t)) * torch.sqrt(1.0 - abar_t / abar_prev)
+        noise = torch.randn_like(x)
+
+        dir_xt = torch.sqrt(1.0 - abar_prev - sigma**2) * eps
+        x = torch.sqrt(abar_prev) * x0_hat + dir_xt + sigma * noise
+
+    return x
+
+
+# ---------------------------
+# Data + training
+# ---------------------------
+def to_minus1_plus1(x):
+    return x * 2 - 1
+
+def get_data(batch_size=128):
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Lambda(to_minus1_plus1),
+    ])
+    dataset = MNIST(root="./data", train=True, download=True, transform=transform)
+    use_cuda = torch.cuda.is_available()
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=use_cuda
+    )
+
+def train(model, ema_model, dataloader, schedules, optimizer, T, epochs=120, log_every=200, device="cpu", ema_decay=0.999):
+    for epoch in range(epochs):
+        running = 0.0
+        for step, (x0, _) in enumerate(dataloader):
+            x0 = x0.to(device)
+
+            t = torch.randint(0, T, (x0.shape[0],), device=device, dtype=torch.long)
+            x_t, noise = q_sample(x0, t, schedules)
+
+            noise_pred = model(x_t, t)
+            loss = F.mse_loss(noise_pred, noise)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+            update_ema(ema_model, model, decay=ema_decay)
+
+            running += loss.item()
+            if (step + 1) % log_every == 0:
+                print(f"Epoch {epoch} Step {step+1}: loss={running/log_every:.4f}")
+                running = 0.0
+
+        print(f"Epoch {epoch}: last_batch_loss={loss.item():.4f}")
+
+
+def show_samples(samples, nrow=4, title="Samples", save_dir="output", filename=None, show=True):
+    os.makedirs(save_dir, exist_ok=True)
+
+    samples = samples.clamp(-1, 1)
+    samples = (samples + 1) / 2  # to [0, 1]
+
+    grid = torchvision.utils.make_grid(samples.cpu(), nrow=nrow)
+
+    # choose filename
+    if filename is None:
+        safe = "".join(c if c.isalnum() or c in "._- " else "_" for c in title).strip()
+        filename = safe.replace(" ", "_") + ".png"
+
+    save_path = os.path.join(save_dir, filename)
+
+    # save with torchvision (clean + fast)
+    torchvision.utils.save_image(grid, save_path)
+
+    if show:
+        plt.figure(figsize=(4, 4))
+        plt.title(title)
+        plt.imshow(grid.permute(1, 2, 0))
+        plt.axis("off")
+        plt.show()
+
+    print("Saved:", save_path)
+
+
+
+def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("Device:", device)
+    if device == "cuda":
+        print("GPU:", torch.cuda.get_device_name(0))
+
+    T = 1000
+    epochs = 120
+    batch_size = 128
+    lr = 2e-4
+    save_dir = r"C:\Research\Sample\output"
+
+    schedules = make_schedules(T, device)
+    model = TimeConditionedCNN(base_ch=128, time_dim=256).to(device)
+
+    ema_model = copy.deepcopy(model).to(device)
+    ema_model.eval()
+    for p in ema_model.parameters():
+        p.requires_grad_(False)
+
+    dataloader = get_data(batch_size=batch_size)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+
+    train(model, ema_model, dataloader, schedules, optimizer, T, epochs=epochs, device=device, ema_decay=0.999)
+
+        # ---- Ablation: clamp vs EMA vs DDIM ----
+    def set_seed(seed=0):
+        torch.manual_seed(seed)
+        if device == "cuda":
+            torch.cuda.manual_seed_all(seed)
+
+    set_seed(0)
+    s1 = sample_ddpm(model, schedules, T, num_samples=16, device=device, clamp_x0=False)
+    show_samples(s1, title="DDPM_model_no_clamp", save_dir=save_dir, filename="01_ddpm_model_no_clamp.png", show=False)
+
+    set_seed(0)
+    s2 = sample_ddpm(model, schedules, T, num_samples=16, device=device, clamp_x0=True)
+    show_samples(s2, title="DDPM_model_x0_clamp", save_dir=save_dir, filename="02_ddpm_model_x0_clamp.png", show=False)
+
+    set_seed(0)
+    s3 = sample_ddpm(ema_model, schedules, T, num_samples=16, device=device, clamp_x0=True)
+    show_samples(s3, title="DDPM_ema_x0_clamp", save_dir=save_dir, filename="03_ddpm_ema_x0_clamp.png", show=False)
+
+    set_seed(0)
+    s4 = sample_ddim(ema_model, schedules, T, steps=50, eta=0.0, num_samples=16, device=device, clamp_x0=True)
+    show_samples(s4, title="DDIM_ema_50steps", save_dir=save_dir, filename="04_ddim_ema_50steps.png", show=False)
+
+
+
+if __name__ == "__main__":
+    main()
