@@ -14,6 +14,7 @@ Run:
 import math
 import copy
 import os
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -389,7 +390,7 @@ def train(model, ema_model, dataloader, schedules, optimizer, T,
 # ---------------------------
 # Visualization + saving
 # ---------------------------
-def show_samples(samples, nrow=4, title="Samples", save_dir="output_v4", filename=None, show=True):
+def show_samples(samples, nrow=4, title="Samples", save_dir="output_v5", filename=None, show=True):
     os.makedirs(save_dir, exist_ok=True)
 
     samples = samples.clamp(-1, 1)
@@ -425,12 +426,12 @@ def main():
         torch.backends.cudnn.benchmark = True
 
     T = 1000
-    epochs = 120
+    epochs = 300
     batch_size = 128
     lr = 2e-4
 
     # Separate folder from v2/v3
-    save_dir = os.path.join(os.path.dirname(__file__), "output_v4")
+    save_dir = os.path.join(os.path.dirname(__file__), "output_v5")
 
     schedules = make_schedules(T, device)
 
@@ -446,8 +447,13 @@ def main():
     dataloader = get_data(batch_size=batch_size)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
+    train_start = time.perf_counter()
+
     train(model, ema_model, dataloader, schedules, optimizer, T,
           epochs=epochs, device=device, ema_decay=0.995)
+
+    train_end = time.perf_counter()
+    print(f"Training time: {(train_end - train_start)/60:.2f} minutes")
 
     # ---- Ablation: clamp vs EMA vs DDIM ----
     def set_seed(seed=0):
@@ -464,7 +470,10 @@ def main():
     show_samples(s2, title="DDPM_model_x0_clamp", save_dir=save_dir, filename="02_ddpm_model_x0_clamp.png", show=False)
 
     set_seed(0)
+    t0 = time.perf_counter()
     s3 = sample_ddpm(ema_model, schedules, T, num_samples=16, device=device, clamp_x0=True)
+    t1 = time.perf_counter()
+    print(f"DDPM sampling time (16 samples, T={T}): {t1 - t0:.2f} seconds")
     show_samples(s3, title="DDPM_ema_x0_clamp", save_dir=save_dir, filename="03_ddpm_ema_x0_clamp.png", show=False)
 
     # DDIM: with U-Net this should be closer to DDPM quality
